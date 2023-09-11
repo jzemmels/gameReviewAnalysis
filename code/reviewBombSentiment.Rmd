@@ -1,0 +1,537 @@
+---
+title: "R Notebook"
+---
+
+scrape data from metacritic
+
+```{r setup}
+library(reticulate)
+library(tidyverse)
+library(tidytext)
+library(stringi)
+library(ggwordcloud)
+library(ggraph)
+library(widyr)
+```
+
+```{python}
+# !pip install requests
+import requests
+# !pip install bs4
+from bs4 import BeautifulSoup
+
+#import time
+#import random as rand 
+# !pip install pandas
+import pandas as pd
+
+# source: https://towardsdatascience.com/web-scraping-metacritic-reviews-using-beautifulsoup-63801bbe200e
+def metacritic(title='the-last-of-us-part-ii',console='playstation-4',source='user',numpages=1):
+  review_dict = {'name':[], 'date':[], 'rating':[], 'review':[]}#, 'thumbsUp':[], 'thumbsTotal':[]}
+  for page in range(0,numpages): #Remember to update the number of pages 
+      url = 'https://www.metacritic.com/game/' + console + '/' + title + '/' + source + '-reviews?page='+str(page)
+      user_agent = {'User-agent': 'Mozilla/5.0'}
+      response  = requests.get(url, headers = user_agent)
+      #time.sleep(rand.randint(3,30)) 
+      soup = BeautifulSoup(response.text, 'html.parser')
+      for review in soup.find_all('div', class_='review_content'):
+          if review.find('div', class_='name') == None:
+                         break 
+          try:
+            review_dict['name'].append(review.find('div', class_='name').find('a').text)
+          except AttributeError:
+            review_dict['name'].append('none')
+          try:
+            review_dict['date'].append(review.find('div', class_='date').text)
+          except AttributeError:
+            review_dict['date'].append("none")
+          try:
+            review_dict['rating'].append(review.find('div', class_='review_grade').find_all('div')[0].text)
+          except AttributeError:
+            review_dict['rating'].append("-1")
+            # review_dict['thumbsUp'].append(review.find
+            # ('span',class_='total_ups').text)
+            # review_dict['thumbsTotal'].append(review.find('span',class_='total_thumbs').text)
+          try:
+            if review.find('span', class_='blurb blurb_expanded'):
+                review_dict['review'].append(review.find('span', class_='blurb blurb_expanded').text)
+            else:
+                review_dict['review'].append(review.find('div', class_='review_body').find('span').text)
+          except AttributeError:
+            review_dict['review'].append("none")
+  return(pd.DataFrame(review_dict))
+```
+
+```{r}
+lou_user <- py$metacritic(title = "the-last-of-us-part-i",console="playstation-5",source = "user",numpages = 144L)
+
+lou_user <- lou_user %>%
+  mutate(date = lubridate::mdy(date),
+         rating = as.numeric(rating),
+         thumbsUp = as.numeric(thumbsUp),
+         thumbsTotal = as.numeric(thumbsTotal),
+         propThumbs = thumbsUp/thumbsTotal)
+```
+
+```{r}
+lou_user <- py$metacritic(title = "cyberpunk-2077",console="playstation-4",source = "user",numpages = 20L)
+
+
+lou_user <- lou_user %>%
+  mutate(name = ifelse(name == "none",NA,name),
+         date = ifelse(date == "none",NA,date),
+         rating = ifelse(rating == "-1",NA,rating),
+         review = ifelse(review == "none",NA,review)) %>%
+  mutate(date = lubridate::mdy(date),
+         rating = as.numeric(rating)
+         # ,thumbsUp = as.numeric(thumbsUp),
+         # thumbsTotal = as.numeric(thumbsTotal),
+         # propThumbs = thumbsUp/thumbsTotal
+         )
+
+library(plotly)
+plt <- lou_user %>%
+  arrange(date) %>%
+  group_by(date) %>%
+  summarize(aveRating = mean(rating),
+            numRatings = n()) %>%
+  ungroup() %>%
+  mutate(runningAveRating = cummean(aveRating)) %>%
+  ggplot(aes(x = date)) +
+  geom_point(aes(y = aveRating,text = paste0("# Ratings: ",numRatings)),alpha = .2) +
+  geom_line(aes(y = runningAveRating),linewidth = 1.3) +
+  theme_bw() +
+  scale_y_continuous(breaks = 1:10) +
+  labs(x = "Date",y = "Daily Average Rating")
+
+plotly::ggplotly(plt)
+```
+
+
+```{r}
+lou_user %>%
+  group_by(date) %>%
+  tally() %>%
+  ggplot(aes(x = date,y = n)) +
+  geom_line() +
+  theme_bw()
+
+lou_user %>%
+  group_by(rating) %>%
+  tally() %>%
+  ggplot(aes(x = rating, y = n)) +
+  geom_bar(stat = "identity") +
+  theme_bw()
+
+lou_user %>%
+  ggplot(aes(x = date,y = rating)) +
+  geom_jitter(width = 0,height = .3) +
+  scale_y_continuous(breaks = 0:10) +
+  theme_bw()
+```
+
+
+```{r}
+data(stop_words,package = "tidytext")
+
+lou_user_noStop <- lou_user %>%
+  tidytext::unnest_tokens(word,review) %>%
+  mutate(word = stringi::stri_trans_general(word,"Latin-ASCII")) %>%
+  anti_join(stop_words,by = "word") 
+
+lou_user_noStop %>%
+  filter(name %in% c("jojo2324","sambhavchordia")) %>%
+  group_by(name,word) %>% 
+  tally(sort = TRUE) %>%
+  pivot_wider(id_cols = c(word),names_from = name,values_from = n) %>%
+  mutate(across(is.numeric,~ ifelse(is.na(.),0,.)))
+```
+
+```{r}
+# word clouds by sentiment measure
+bing <- tidytext::get_sentiments("bing")
+afinn <- tidytext::get_sentiments("afinn")
+loughran <- tidytext::get_sentiments("loughran")
+nrc <- tidytext::get_sentiments("nrc")
+
+lou_user_sentiment <- lou_user_noStop %>%
+  left_join(bing %>%
+              rename(bing = sentiment),
+            by = "word") %>%
+  left_join(afinn %>%
+              rename(afinn = value),
+            by = "word") %>%
+  left_join(loughran %>%
+              rename(loughran = sentiment),
+            by = "word") %>%
+  left_join(nrc %>%
+              rename(nrc = sentiment),
+            by = "word")
+
+lou_user_sentiment %>%
+  pivot_longer(cols = c("bing","loughran","nrc"),
+               names_to = "measure",values_to = "value") %>%
+  filter(!is.na(value) | !is.na(afinn)) %>%
+  group_by(measure,value,word) %>%
+  summarize(n = n(),
+            afinn = mean(afinn)) %>%
+  filter(!is.na(value)) %>%
+  filter(value %in% c("positive","negative") & n > 5) %>%
+  ggplot() +
+  geom_text_wordcloud(aes(label = word,size = n)) +
+  facet_grid(rows = vars(measure),
+             cols = vars(value)) +
+  theme_bw()
+```
+
+```{r}
+lou_user_sentiment %>%
+  pivot_longer(cols = c("bing","loughran","nrc"),
+               names_to = "measure",values_to = "value") %>%
+  filter(value %in% c("positive","negative")) %>%
+  group_by(name,rating,measure) %>%
+  summarize(propPos = sum(value == "positive",na.rm=TRUE)/n()) %>%
+  ggplot(aes(x = propPos,y = rating)) +
+  geom_jitter(aes(),width = .1,height = .5) +
+  facet_wrap(~measure) +
+  geom_smooth(se = FALSE) +
+  theme_bw()
+```
+
+
+```{r}
+# score vs. afinn sentiment, afinn may not be best measure of sentiment here
+lou_user_sentiment %>%
+  filter(!is.na(afinn)) %>%
+  group_by(name,rating) %>%
+  summarize(afinn = mean(afinn)) %>%
+  ggplot(aes(x = afinn,y = rating)) +
+  geom_jitter(width = .2,height = .5) +
+  geom_smooth(se = FALSE,method = "lm") +
+  theme_bw()
+```
+
+
+```{r}
+# measure of sentiment per review using afinn
+lou_user_sentiment %>%
+  group_by(name) %>%
+  summarize(afinn = mean(afinn,na.rm=TRUE))  %>%
+  ggplot(aes(x = afinn)) +
+  geom_histogram() +
+  theme_bw()
+
+# word cloud by afinn value
+lou_user_sentiment %>%
+  filter(!is.na(afinn)) %>%
+  group_by(afinn,word) %>%
+  tally() %>%
+  filter(n > 3) %>%
+  ggplot() +
+  geom_text_wordcloud(aes(label = word,size = n)) +
+  facet_wrap(~ afinn,labeller = label_both) +
+  theme_bw()
+
+# bandwagon: proportion of thumb-ups vs afinn value
+lou_user_sentiment %>%
+  filter(!is.na(afinn)) %>%
+  group_by(name,propThumbs) %>%
+  summarize(afinn = mean(afinn)) %>%
+  ggplot(aes(x = afinn,y = propThumbs)) +
+  geom_point() +
+  geom_smooth(se = FALSE,method = "lm") +
+  theme_bw() +
+  labs(x = "Average Review Sentiment",
+       y = "Proportion of others who found review helpful")
+```
+
+Consider n-grams
+
+```{r}
+data(stop_words,package = "tidytext")
+
+# consider bigrams
+lou_user %>%
+  unnest_tokens(bigram,review,token = "ngrams",n = 2) %>%
+  tidyr::separate(col = bigram,into = c("word1","word2"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word)) %>%
+  group_by(bigram) %>%
+  tally(sort = TRUE) %>%
+  filter(n > 15) %>%
+  ggplot(aes(x = n,y = reorder(bigram,n))) +
+  geom_bar(stat = "identity") +
+  theme_bw()
+```
+
+```{r}
+# consider common "positive" and "negative" associated words
+commonSentiments <- lou_user_sentiment %>%
+  filter(!is.na(afinn)) %>%
+  group_by(afinn,word) %>%
+  tally() %>%
+  arrange(afinn,desc(n)) %>%
+  filter(n > 30)
+
+lou_user %>%
+  unnest_tokens(bigram,review,token = "ngrams",n = 2) %>%
+  # filter extra trolly reviews
+  filter(!str_detect(bigram,"awesomeawesomeawesomeawesomeawesome") & !str_detect(bigram,"yaaaaaaaaaaaaaaaaaaa")) %>%
+  tidyr::separate(col = bigram,into = c("word1","word2"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word)) %>%
+  filter(word1 %in% commonSentiments$word) %>% #| word2 == commonSentiments$word) %>%
+  group_by(bigram,word1,word2) %>%
+  tally(sort  = TRUE) %>%
+  filter(n > 1)  %>%
+  left_join(commonSentiments %>%
+              select(-n),
+            by = c("word1" = "word")) %>%
+  mutate(sentimentStrength = n*afinn) %>%
+  ggplot(aes(x = sentimentStrength,y = word2)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  facet_wrap(~ word1,scales = "free_y")
+```
+
+
+```{r}
+# trigrams don't have an interesting pattern, many contain stop words in other
+# languages
+lou_user %>%
+  unnest_tokens(trigram,review,token = "ngrams",n = 3) %>%
+  tidyr::separate(col = trigram,into = c("word1","word2","word3"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word | word3 %in% stop_words$word)) %>%
+  group_by(trigram) %>%
+  tally(sort = TRUE)
+
+lou_user %>%
+  unnest_tokens(trigram,review,token = "ngrams",n = 3) %>%
+  tidyr::separate(col = trigram,into = c("word1","word2","word3"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word | word3 %in% stop_words$word)) %>%
+  filter(word1 %in% commonSentiments$word) %>%
+  group_by(trigram) %>%
+  tally(sort = TRUE)
+```
+
+```{r}
+# consider graph visualization of bigrams
+bigram_graph <- lou_user %>%
+  unnest_tokens(bigram,review,token = "ngrams",n = 2) %>%
+  filter(!str_detect(bigram,"awesomeawesomeawesomeawesomeawesome") & !str_detect(bigram,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(bigram,"sucksjd")) %>%
+  tidyr::separate(col = bigram,into = c("word1","word2"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word)) %>%
+  group_by(word1,word2) %>%
+  tally(sort  = TRUE) %>%
+  filter(n > 10) %>%
+  igraph::graph_from_data_frame()
+
+
+set.seed(2020)
+
+a <- grid::arrow(type = "closed", length = unit(.15, "inches"))
+
+ggraph(bigram_graph, layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = a, end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+```{r}
+# which reviews mention resident evil? People likening this remake to remakes of
+# RE games
+lou_user %>%
+  filter(str_detect(review,"resident evil")) %>%
+  pull(review)
+```
+
+```{r}
+# one reviewer is particularly upset about not being able to change the PSN
+# region
+lou_user %>%
+  filter(str_detect(review,"PSN")) %>%
+  pull(review)
+```
+
+```{r}
+# consider sentiment of reviews mentioning game price
+lou_user %>%
+  filter(str_detect(review,"70") | str_detect(review,"price")) %>%
+  unnest_tokens(bigram,review,token = "ngrams",n = 2) %>%
+  filter(!str_detect(bigram,"awesomeawesomeawesomeawesomeawesome") & !str_detect(bigram,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(bigram,"sucksjd")) %>%
+  tidyr::separate(col = bigram,into = c("word1","word2"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word)) %>%
+  left_join(afinn,by = c("word1" = "word")) %>%
+  filter(!is.na(value)) %>%
+  group_by(word1,word2) %>%
+  tally(sort = TRUE)
+
+# generally negative reviews that mention game being worth 70 or paying 70
+lou_user %>%
+  filter(str_detect(review,"worth 70") | str_detect(review,"pay 70")) %>%
+  pull(review)
+```
+ 
+```{r}
+data("stop_words")
+
+# consider relationships between words, remove reviews in other languages
+lou_pairwise <-  lou_user %>%
+    mutate(review = stringi::stri_trans_general(review,"Latin-ASCII")) %>%
+    filter(!str_detect(review,"в|и|не") &
+           !str_detect(review,"juego") &
+             !str_detect(review,"jogo") &
+             !str_detect(review,"jeu")) %>%
+  unnest_tokens(word, review) %>%
+  filter(!word %in% stop_words$word) %>%
+  group_by(word) %>%
+  filter(n() > 20) %>%
+  ungroup() %>%
+  widyr::pairwise_cor(word,name,sort = TRUE)
+
+lou_pairwise %>%
+  filter(correlation > .25) %>%
+  filter(!(item1 %in% c("el","la","es","de","na","som","si"))) %>%
+  igraph::graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = correlation), show.legend = FALSE) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE) +
+  theme_void()
+```
+
+
+
+```{r}
+# perform LDA on reviews
+# install.packages("tm")
+# install.packages("topicmodels")
+lou_dtm <- 
+  lou_user %>%
+    mutate(review = stringi::stri_trans_general(review,"Latin-ASCII")) %>%
+    filter(!str_detect(review,"в|и|не") &
+           !str_detect(review,"juego") &
+             !str_detect(review,"jogo") &
+             !str_detect(review,"jeu")) %>%
+  unnest_tokens(word, review) %>%
+  filter(!word %in% stop_words$word) %>%
+  filter(!(word %in% c("el","la","es","de","na","som","si","sa", "aj", "die", "ako", "ale", "pc", "ze", "das", "ci", 
+"fps", "hier", "je", "ist", "bol", "hry", "prvy", "und", "mi", 
+"و", "abby", "bola", "bolo", "hra", "hru", "nevedel", "ein", 
+"spiel", "par", "mal", "ani", "ich", "ma", 
+"po", "vobec", "der", "kann", "einfach", "ta", "este", "tak", 
+"بازی", "az", "cez", "hral", "hre", "kde", "ked", "ku", "moj", 
+"niekedy", "od", "roku", "tym", "uz", "vyhral", "از", 
+"oder"))) %>%
+  filter(!str_detect(word,"awesomeawesomeawesomeawesomeawesome") & !str_detect(word,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(word,"sucksjd")) %>%
+  # remove words that we would expect to be in all types of reviews
+  filter(!(word %in% c("game","naughty","dog"))) %>%
+  group_by(name,word) %>%
+  tally() %>%
+  cast_dtm(name,word,n)
+
+lou_lda <- topicmodels::LDA(lou_dtm,k = 2)
+
+# consider words on a per-topic basis, doesn't really uncover what the 5 topics
+# might be
+tidy(lou_lda,matrix  = "beta") %>%
+  group_by(topic) %>%
+  # filter(topic == 9) %>% arrange(desc(beta))
+  slice_max(order_by = beta,n = 5)
+```
+
+```{r}
+# using augment will show the topic to which a particular term used in a
+# particular review was assigned. Cluster 1 seems to emphasize the $70 price tag
+# while cluster 2 focuses on more positive aspects of the game
+augment(lou_lda,data = lou_dtm) %>%
+  group_by(term,.topic) %>%
+  summarize(count = sum(count)) %>%
+  arrange(desc(count)) %>%
+  group_by(.topic) %>%
+  slice_max(order_by = count,n = 15) %>%
+  ggplot(aes(x = count,y = reorder(term,count))) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~.topic,scales = "free_y") +
+  theme_bw()
+```
+
+```{r}
+# use matrix = "gamma" to get estimate of which topic each review belongs to
+topicFocusedReviews <- 
+  tidy(lou_lda,matrix  = "gamma") %>%
+  group_by(document) %>%
+  filter(gamma == max(gamma))
+
+# analyze the reviews that are most focused on the two topics
+
+# do the topics differ by rating? Maybe topic 2  has more positive reviews
+lou_user %>%
+  inner_join(topicFocusedReviews,by = c("name" = "document")) %>%
+  group_by(topic) %>%
+  summarize(rating = mean(rating))
+
+lou_user %>%
+  inner_join(topicFocusedReviews,by = c("name" = "document")) %>%
+  group_by(topic,rating) %>%
+  tally() %>%
+  ggplot(aes(x = rating,y = n)) +
+  geom_bar(stat = 'identity') +
+  theme_bw() +
+  facet_wrap(~topic)
+```
+
+```{r}
+# do different bigrams form between the two topics?
+lou_user_topic_bigraph <- lou_user %>%
+  inner_join(topicFocusedReviews,by = c("name" = "document")) %>%
+  unnest_tokens(bigram,review,token = "ngrams",n = 2) %>%
+  filter(!str_detect(bigram,"awesomeawesomeawesomeawesomeawesome") & !str_detect(bigram,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(bigram,"sucksjd")) %>%
+  tidyr::separate(col = bigram,into = c("word1","word2"),sep = " ",remove = FALSE) %>%
+  filter(!(word1 %in% stop_words$word | word2 %in% stop_words$word)) %>%
+  filter(!(word1 %in% c("el","la","es","de","na","som","si","sa", "aj", "die", "ako", "ale", "pc", "ze", "das", "ci", 
+"fps", "hier", "je", "ist", "bol", "hry", "prvy", "und", "mi", 
+"و", "abby", "bola", "bolo", "hra", "hru", "nevedel", "ein", 
+"spiel", "par", "mal", "ani", "ich", "ma", 
+"po", "vobec", "der", "kann", "einfach", "ta", "este", "tak", 
+"بازی", "az", "cez", "hral", "hre", "kde", "ked", "ku", "moj", 
+"niekedy", "od", "roku", "tym", "uz", "vyhral", "از", 
+"oder")) & !(word2 %in% c("el","la","es","de","na","som","si","sa", "aj", "die", "ako", "ale", "pc", "ze", "das", "ci", 
+"fps", "hier", "je", "ist", "bol", "hry", "prvy", "und", "mi", 
+"و", "abby", "bola", "bolo", "hra", "hru", "nevedel", "ein", 
+"spiel", "par", "mal", "ani", "ich", "ma", 
+"po", "vobec", "der", "kann", "einfach", "ta", "este", "tak", 
+"بازی", "az", "cez", "hral", "hre", "kde", "ked", "ku", "moj", 
+"niekedy", "od", "roku", "tym", "uz", "vyhral", "از", 
+"oder"))) %>%
+  filter(!str_detect(word1,"awesomeawesomeawesomeawesomeawesome") & !str_detect(word1,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(word1,"sucksjd") & !str_detect(word2,"awesomeawesomeawesomeawesomeawesome") & !str_detect(word2,"yaaaaaaaaaaaaaaaaaaa") & !str_detect(word2,"sucksjd")) %>%
+  # remove words that we would expect to be in all types of reviews
+  filter(!(word1 %in% c("game","naughty","dog")) & !(word2 %in% c("game","naughty","dog")))
+
+# perhaps topic 1 focuses more on the price for perceived value and compares to
+# other games (e.g., resident evil), topic 2 focuses more on aspects of the game
+# like graphics, gameplay, and accessibility
+
+lou_user_topic_bigraph %>%
+  group_by(topic,word1,word2) %>%
+  tally(sort  = TRUE) %>%
+  filter(n > 5) %>%
+  igraph::graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n), show.legend = FALSE,
+                 arrow = grid::arrow(type = "closed", length = unit(.15, "inches")), 
+                 end_cap = circle(.07, 'inches')) +
+  geom_node_point(color = "lightblue", size = 5) +
+  geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+  theme_void()
+```
+
+
+
+
+
+
+
+
+
+
